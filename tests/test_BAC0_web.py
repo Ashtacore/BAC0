@@ -10,7 +10,7 @@ import time
 import BAC0
 
 
-def test_bac0_connect_ok():
+def test_bac0_web_ok():
     fake_bac0_obj = "my_test_bac0"
     fake_device_id = 666
     fake_firmware_revision = "0.1.0"
@@ -32,6 +32,7 @@ def test_bac0_connect_ok():
         modelName=fake_model_name,
         vendorId=fake_vendor_id,
         vendorName=fake_vendor_name,
+        port=47812,
     )
 
     assert bacnet.localObjName == fake_bac0_obj
@@ -45,4 +46,4 @@ def test_bac0_connect_ok():
     assert bacnet.vendorName == fake_vendor_name
 
     bacnet.disconnect()
-    time.sleep(1)
+    time.sleep(2)

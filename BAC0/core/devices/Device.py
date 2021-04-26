@@ -43,12 +43,16 @@ from ..io.IOExceptions import (
     SegmentationNotSupported,
     BadDeviceDefinition,
     RemovedPointException,
+    WritePropertyException,
+    WrongParameter,
+    DeviceNotConnected,
 )
 
 # from ...bokeh.BokehRenderer import BokehPlot
 from ...sql.sql import SQLMixin
 from ...tasks.DoOnce import DoOnce
 from .mixins.read_mixin import ReadPropertyMultiple, ReadProperty
+from .Virtuals import VirtualPoint
 
 from ..utils.notes import note_and_log
 
@@ -131,8 +135,10 @@ class Device(SQLMixin):
         segmentation_supported=True,
         object_list=None,
         auto_save=False,
+        save_resampling="1s",
         clear_history_on_save=False,
-        history_size=None
+        history_size=None,
+        reconnect_on_failure=True
     ):
 
         self.properties = DeviceProperties()
@@ -141,18 +147,17 @@ class Device(SQLMixin):
         self.properties.device_id = device_id
         self.properties.network = network
         self.properties.pollDelay = poll
-        if poll < 10:
-            self.properties.fast_polling = True
-        else:
-            self.properties.fast_polling = False
+        self.properties.fast_polling = True if poll < 10 else False
         self.properties.name = ""
         self.properties.vendor_id = 0
         self.properties.objects_list = []
         self.properties.pss = ServicesSupported()
         self.properties.multistates = {}
         self.properties.auto_save = auto_save
+        self.properties.save_resampling = save_resampling
         self.properties.clear_history_on_save = clear_history_on_save
-        self.properties.history_size = history_size
+        self.properties.default_history_size = history_size
+        self._reconnect_on_failure = reconnect_on_failure
 
         self.segmentation_supported = segmentation_supported
         self.custom_object_list = object_list
@@ -186,7 +191,7 @@ class Device(SQLMixin):
             if (
                 self.properties.network
                 and self.properties.address
-                and self.properties.device_id
+                and self.properties.device_id is not None
             ):
                 self.new_state(DeviceDisconnected)
             else:
@@ -317,8 +322,7 @@ class Device(SQLMixin):
         for point in self.points:
             point.clear_history()
 
-    def update_history_size(self, size):
-        self.properties.history_size = size
+    def update_history_size(self, size=None):
         for point in self.points:
             point.properties.history_size = size
 
@@ -358,9 +362,11 @@ class Device(SQLMixin):
         Find point based on type and address
         """
         for point in self.points:
-            if point.properties.type == objectType:
-                if float(point.properties.address) == objectAddress:
-                    return point
+            if (
+                point.properties.type == objectType
+                and float(point.properties.address) == objectAddress
+            ):
+                return point
         raise ValueError(
             "{} {} doesn't exist in controller".format(objectType, objectAddress)
         )
@@ -530,13 +536,18 @@ class DeviceConnected(Device):
             )
             if self.properties.pollDelay > 0:
                 self.poll(delay=self.properties.pollDelay)
+            self.update_history_size(size=self.properties.default_history_size)
+            # self.clear_histories()
         except NoResponseFromController as error:
             self._log.error("Cannot retrieve object list, disconnecting...")
             self.segmentation_supported = False
             self.new_state(DeviceDisconnected)
         except IndexError as error:
-            self._log.error("Device creation failed... disconnecting")
-            self.new_state(DeviceDisconnected)
+            if self._reconnect_on_failure:
+                self._log.error("Device creation failed... re-connecting")
+                self.new_state(DeviceDisconnected)
+            else:
+                self._log.error("Device creation failed... disconnecting")
 
     def __getitem__(self, point_name):
         """
@@ -549,6 +560,13 @@ class DeviceConnected(Device):
         try:
             if isinstance(point_name, list):
                 return self.df(point_name, force_read=False)
+            elif isinstance(point_name, tuple):
+                _type, _address = point_name
+                for point in self.points:
+                    if point.properties.type == _type and str(
+                        point.properties.address
+                    ) == str(_address):
+                        return point
             else:
                 try:
                     return self._findPoint(point_name, force_read=False)
@@ -559,17 +577,18 @@ class DeviceConnected(Device):
                         try:
                             if "@prop_" in point_name:
                                 point_name = point_name.split("prop_")[1]
-                            return self.read_property(
-                                ("device", self.properties.device_id, point_name)
-                            )
-                        except Exception as e:
-                            raise ValueError(e)
+                                return self.read_property(
+                                    ("device", self.properties.device_id, point_name)
+                                )
+                            else:
+                                raise ValueError()
+                        except ValueError as ve:
+                            raise ValueError()
         except ValueError as ve:
             self._log.error("{}".format(ve))
 
     def __iter__(self):
-        for each in self.points:
-            yield each
+        yield from self.points
 
     def __contains__(self, value):
         """
@@ -577,6 +596,14 @@ class DeviceConnected(Device):
             if "point_name" in device:
         """
         return value in self.points_name
+
+    @property
+    def pollable_points_name(self):
+        for each in self.points:
+            if not isinstance(each, VirtualPoint):
+                yield each.properties.name
+            else:
+                continue
 
     @property
     def points_name(self):
@@ -590,7 +617,7 @@ class DeviceConnected(Device):
         """
         try:
             self._findPoint(point_name)._set(value)
-        except ValueError as ve:
+        except WritePropertyException as ve:
             self._log.error("{}".format(ve))
 
     def __len__(self):
@@ -651,7 +678,7 @@ class DeviceConnected(Device):
                 us.append(each.properties.units_state)
         return dict(zip(bs, us))
 
-    def _findPoint(self, name, force_read=True):
+    def _findPoint(self, name, force_read=False):
         """
         Used by getter and setter functions
         """
@@ -668,9 +695,13 @@ class DeviceConnected(Device):
             yield trendlog
 
     @property
-    def trendlogs(self):
+    def trendlogs_names(self):
         for each in self._trendlogs():
             yield each.properties.object_name
+
+    @property
+    def trendlogs(self):
+        return list(self._trendlogs())
 
     def _findTrend(self, name):
         for trend in self._trendlogs():
@@ -700,23 +731,28 @@ class DeviceConnected(Device):
             raise Exception("Unknown property : {}".format(error))
         return val
 
-    def write_property(self, prop, value, priority=16):
-        if isinstance(prop, tuple):
-            _obj, _instance, _prop = prop
+    def write_property(self, prop, value, priority=None):
+        if prop == "description":
+            self.update_description(value)
         else:
-            raise ValueError(
-                "Please provide property using tuple with object, instance and property"
-            )
-        try:
-            request = "{} {} {} {} {} - {}".format(
-                self.properties.address, _obj, _instance, _prop, value, priority
-            )
-            val = self.properties.network.write(
-                request, vendor_id=self.properties.vendor_id
-            )
-        except KeyError as error:
-            raise Exception("Unknown property : {}".format(error))
-        return val
+            if priority is not None:
+                priority = "- {}".format(priority)
+            if isinstance(prop, tuple):
+                _obj, _instance, _prop = prop
+            else:
+                raise ValueError(
+                    "Please provide property using tuple with object, instance and property"
+                )
+            try:
+                request = "{} {} {} {} {} {}".format(
+                    self.properties.address, _obj, _instance, _prop, value, priority
+                )
+                val = self.properties.network.write(
+                    request, vendor_id=self.properties.vendor_id
+                )
+            except KeyError as error:
+                raise Exception("Unknown property : {}".format(error))
+            return val
 
     def update_bacnet_properties(self):
         """
@@ -732,6 +768,8 @@ class DeviceConnected(Device):
                 prop_id_required=True,
             )
             for each in res:
+                if not each:
+                    continue
                 v, prop = each
                 self.properties.bacnet_properties[prop] = v
 
@@ -746,6 +784,16 @@ class DeviceConnected(Device):
     @property
     def bacnet_properties(self):
         return self._bacnet_properties(update=True)
+
+    def update_description(self, value):
+        self.properties.network.send_text_write_request(
+            addr=self.properties.address,
+            obj_type="device",
+            obj_inst=int(self.device_id),
+            value=value,
+            prop_id="description",
+        )
+        self.properties.description = self.read_property("description")
 
     def __repr__(self):
         return "{} / Connected".format(self.properties.name)
@@ -829,6 +877,7 @@ class DeviceDisconnected(Device):
                 self.new_state(RPDeviceConnected)
 
             except (NoResponseFromController, AttributeError) as error:
+                self._log.warning("Error connecting: %s", error)
                 if self.properties.db_name:
                     self.new_state(DeviceFromDB)
                 else:
@@ -974,7 +1023,7 @@ class DeviceFromDB(DeviceConnected):
             except NoResponseFromController:
                 self._log.error("Unable to connect, keeping DB mode active")
 
-        elif from_backup or not network:
+        else:
             self._log.debug("Not connected, open DB")
             if from_backup:
                 self.properties.db_name = from_backup.split(".")[0]
@@ -1058,12 +1107,3 @@ class DeviceLoad(DeviceFromDB):
             Device.__init__(self, None, None, None, from_backup=filename)
         else:
             raise Exception("Please provide backup file as argument")
-
-
-# Some exceptions
-class DeviceNotConnected(Exception):
-    pass
-
-
-class WrongParameter(Exception):
-    pass

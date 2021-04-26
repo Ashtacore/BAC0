@@ -20,8 +20,10 @@ import subprocess
 import ipaddress
 import sys
 import re
+from ...core.utils.notes import note_and_log
 
 
+@note_and_log
 class HostIP:
     """
     Special class to identify host IP informations
@@ -103,49 +105,28 @@ class HostIP:
         a default IP address when defining Script
 
         :param ip: (str) optionnal IP address. If not provided, default to getIPAddr()
-        :param mask: (str) optionnal subnet mask. If not provided, will try to find one using ipconfig (Windows) or ifconfig (Linux or MAC)
-
+        
         :returns: broadcast IP Adress as String
         """
-        ip = ip
+        try:
+            import netifaces
 
-        if "win32" in sys.platform:
-            try:
-                proc = subprocess.Popen("ipconfig", stdout=subprocess.PIPE)
-                while True:
-                    line = proc.stdout.readline()
-                    if ip.encode() in line:
-                        break
-                mask = (
-                    proc.stdout.readline()
-                    .rstrip()
-                    .split(b":")[-1]
-                    .replace(b" ", b"")
-                    .decode()
-                )
-            except:
-                raise NetworkInterfaceException("Cannot read IP parameters from OS")
-        else:
-            """
-            This procedure could use more direct way of obtaining the broadcast IP
-            as it is really simple in Unix
-            ifconfig gives Bcast directly for example
-            or use something like :
-            iface = "eth0"
-            socket.inet_ntoa(fcntl.ioctl(socket.socket(socket.AF_INET, socket.SOCK_DGRAM), 35099, struct.pack('256s', iface))[20:24])
-            """
-            pattern = re.compile(r"(255.\d{1,3}.\d{1,3}.\d{1,3})")
+            interfaces = netifaces.interfaces()
+            for nic in interfaces:
+                addresses = netifaces.ifaddresses(nic)
+                try:
+                    for address in addresses[netifaces.AF_INET]:
+                        if address["addr"] == ip:
+                            return address["netmask"]
+                except KeyError:
+                    pass
 
-            try:
-                proc = subprocess.Popen("ifconfig", stdout=subprocess.PIPE)
-                while True:
-                    line = proc.stdout.readline()
-                    if ip.encode() in line:
-                        break
-                mask = re.findall(pattern, line.decode())[0]
-            except:
-                mask = "255.255.255.255"
-        return mask
+            return "255.255.255.255"
+        except ImportError:
+            self._log.warning(
+                "Netifaces not installed on your system. BAC0 can't detect the subnet.\nPlease provide subnet for now, we'll consider 255.255.255.0 (/24).\nYou can install netifaces using 'pip install netifaces'."
+            )
+            return "255.255.255.0"
 
 
 def validate_ip_address(ip):

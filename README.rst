@@ -47,8 +47,8 @@ But also a really good tool to assist your startup, test and balancing. Using Ju
 even be able to create nice looking report right from your code.
 
 
-.. |build-status| image:: https://travis-ci.org/ChristianTremblay/BAC0.svg?branch=master
-   :target: https://travis-ci.org/ChristianTremblay/BAC0
+.. |build-status| image:: https://github.com/ChristianTremblay/BAC0/workflows/Build%20&%20Test/badge.svg?branch=master
+   :target: https://github.com/ChristianTremblay/BAC0/actions
    :alt: Build status
      
 .. |docs| image:: https://readthedocs.org/projects/bac0/badge/?version=latest

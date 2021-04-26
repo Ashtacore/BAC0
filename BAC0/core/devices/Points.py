@@ -9,11 +9,19 @@ Points.py - Definition of points so operations on Read results are more convenie
 """
 
 # --- standard Python modules ---
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import namedtuple
 import time
 
-from bacpypes.primitivedata import CharacterString
+from bacpypes.primitivedata import (
+    CharacterString,
+    Null,
+    Atomic,
+    Integer,
+    Unsigned,
+    Real,
+    Enumerated,
+)
 
 # --- 3rd party modules ---
 try:
@@ -35,6 +43,7 @@ from ..io.IOExceptions import (
     NoResponseFromController,
     UnknownPropertyError,
     RemovedPointException,
+    WritePropertyException,
 )
 from ..utils.notes import note_and_log
 
@@ -80,6 +89,8 @@ class Point:
     is added to a history table. Histories capture the changes to point values over time.
     """
 
+    _cache_delta = timedelta(seconds=1)
+
     def __init__(
         self,
         device=None,
@@ -104,10 +115,10 @@ class Point:
         self._match_task.running = False
 
         self._history.timestamp = []
-        self._history.value = []
-        self._history.value.append(presentValue)
+        self._history.value = [presentValue]
         self._history.timestamp.append(datetime.now())
-        self.history_size = history_size
+
+        self.properties.history_size = history_size
 
         self.properties.device = device
         self.properties.name = pointName
@@ -119,11 +130,21 @@ class Point:
         self.properties.simulated = (False, 0)
         self.properties.overridden = (False, 0)
 
+        self.cov_registered = False
+
+        self._cache = {"_previous_read": (None, None)}
+
     @property
     def value(self):
         """
         Retrieve value of the point
         """
+        if (
+            self._cache["_previous_read"][0]
+            and datetime.now() - self._cache["_previous_read"][0] < Point._cache_delta
+        ):
+            return self._cache["_previous_read"][1]
+
         try:
             res = self.properties.device.properties.network.read(
                 "{} {} {} presentValue".format(
@@ -133,10 +154,10 @@ class Point:
                 ),
                 vendor_id=self.properties.device.properties.vendor_id,
             )
-            self._trend(res)
+            # self._trend(res)
         except Exception as e:
             raise
-
+        self._cache["_previous_read"] = (datetime.now(), res)
         return res
 
     def read_priority_array(self):
@@ -163,7 +184,7 @@ class Point:
 
     def read_property(self, prop):
         try:
-            res = self.properties.device.properties.network.read(
+            return self.properties.device.properties.network.read(
                 "{} {} {} {}".format(
                     self.properties.device.properties.address,
                     self.properties.type,
@@ -172,7 +193,6 @@ class Point:
                 ),
                 vendor_id=0,
             )
-            return res
         except Exception as e:
             raise Exception("Problem reading : {} | {}".format(self.properties.name, e))
 
@@ -192,6 +212,8 @@ class Point:
                 prop_id_required=True,
             )
             for each in res:
+                if not each:
+                    continue
                 v, prop = each
                 self.properties.bacnet_properties[prop] = v
 
@@ -239,7 +261,7 @@ class Point:
     def _trend(self, res):
         self._history.timestamp.append(datetime.now())
         self._history.value.append(res)
-        if self.properties.history_size == None:
+        if self.properties.history_size is None:
             return
         else:
             if self.properties.history_size < 1:
@@ -339,33 +361,36 @@ class Point:
         :param priority: (int) priority to which write.
 
         """
-        if priority != "":
-            if (
-                isinstance(float(priority), float)
-                and float(priority) >= 1
-                and float(priority) <= 16
-            ):
-                priority = "- {}".format(priority)
-            else:
-                raise ValueError("Priority must be a number between 1 and 16")
+        if prop == "description":
+            self.update_description(value)
+        else:
+            if priority != "":
+                if (
+                    isinstance(float(priority), float)
+                    and float(priority) >= 1
+                    and float(priority) <= 16
+                ):
+                    priority = "- {}".format(priority)
+                else:
+                    raise ValueError("Priority must be a number between 1 and 16")
 
-        try:
-            self.properties.device.properties.network.write(
-                "{} {} {} {} {} {}".format(
-                    self.properties.device.properties.address,
-                    self.properties.type,
-                    self.properties.address,
-                    prop,
-                    value,
-                    priority,
-                ),
-                vendor_id=self.properties.device.properties.vendor_id,
-            )
-        except NoResponseFromController:
-            raise
+            try:
+                self.properties.device.properties.network.write(
+                    "{} {} {} {} {} {}".format(
+                        self.properties.device.properties.address,
+                        self.properties.type,
+                        self.properties.address,
+                        prop,
+                        value,
+                        priority,
+                    ),
+                    vendor_id=self.properties.device.properties.vendor_id,
+                )
+            except NoResponseFromController:
+                raise
 
-        # Read after the write so history gets updated.
-        self.value
+            # Read after the write so history gets updated.
+            self.value
 
     def default(self, value):
         self.write(value, prop="relinquishDefault")
@@ -379,12 +404,10 @@ class Point:
         :param value: (float) value to simulate
         """
         if (
-            self.properties.simulated[0]
-            and self.properties.simulated[1] == value
-            and force == False
+            not self.properties.simulated[0]
+            or self.properties.simulated[1] != value
+            or force != False
         ):
-            pass
-        else:
             self.properties.device.properties.network.sim(
                 "{} {} {} presentValue {}".format(
                     self.properties.device.properties.address,
@@ -442,7 +465,10 @@ class Point:
         AnalogValue are written to
         AnalogOutput are overridden
         """
-        if "Value" in self.properties.type:
+        if "characterstring" in self.properties.type:
+            self.write(value)
+
+        elif "Value" in self.properties.type:
             if str(value).lower() == "auto":
                 raise ValueError(
                     "Value was not simulated or overridden, cannot release to auto"
@@ -468,7 +494,7 @@ class Point:
         Allows the syntax:
             device['point'] = value
         """
-        raise Exception("Must be overridden")
+        raise NotImplementedError("Must be overridden")
 
     def poll(self, command="start", *, delay=10):
         """
@@ -531,7 +557,7 @@ class Point:
         else:
             raise RuntimeError("Stop task before redefining it")
 
-    def match_value(self, value, *, delay=5):
+    def match_value(self, value, *, delay=5, use_last_value=False):
         """
         This allow functions like :
             device['point'].match('value')
@@ -539,7 +565,9 @@ class Point:
         A sensor will follow a calculation...
         """
         if self._match_task.task is None:
-            self._match_task.task = Match_Value(value=value, point=self, delay=delay)
+            self._match_task.task = Match_Value(
+                value=value, point=self, delay=delay, use_last_value=use_last_value
+            )
             self._match_task.task.start()
             self._match_task.running = True
 
@@ -548,7 +576,9 @@ class Point:
             self._match_task.running = False
             time.sleep(1)
 
-            self._match_task.task = Match_Value(value=value, point=self, delay=delay)
+            self._match_task.task = Match_Value(
+                value=value, point=self, delay=delay, use_last_value=use_last_value
+            )
             self._match_task.task.start()
             self._match_task.running = True
 
@@ -564,6 +594,34 @@ class Point:
         Length of a point = # of history records
         """
         return len(self.history)
+
+    def subscribe_cov(self, confirmed=True, lifetime=None, callback=None):
+        address = self.properties.device.properties.address
+        obj_tuple = (self.properties.type, int(self.properties.address))
+        self.properties.device.properties.network.cov(
+            address,
+            obj_tuple,
+            confirmed=confirmed,
+            lifetime=lifetime,
+            callback=callback,
+        )
+
+    def cancel_cov(self, callback=None):
+        address = self.properties.device.properties.address
+        obj_tuple = (self.properties.type, int(self.properties.address))
+        self.properties.device.properties.network.cancel_cov(
+            address, obj_tuple, callback=callback
+        )
+
+    def update_description(self, value):
+        self.properties.device.properties.network.send_text_write_request(
+            addr=self.properties.device.properties.address,
+            obj_type=self.properties.type,
+            obj_inst=int(self.properties.address),
+            value=value,
+            prop_id="description",
+        )
+        self.properties.description = self.read_property("description")
 
 
 # ------------------------------------------------------------------------------
@@ -599,6 +657,12 @@ class NumericPoint(Point):
         )
 
     @property
+    def value(self):
+        res = super().value
+        self._trend(res)
+        return res
+
+    @property
     def units(self):
         return self.properties.units_state
 
@@ -612,15 +676,26 @@ class NumericPoint(Point):
                 val = float(value)
                 if isinstance(val, float):
                     self._setitem(value)
-            except:
-                raise ValueError("Value must be numeric")
+            except Exception as error:
+                raise WritePropertyException(
+                    "Problem writing to device : {}".format(error)
+                )
 
     def __repr__(self):
-        polling = self.properties.device.properties.pollDelay
-        if polling < 60 and polling > 0:
-            val = float(self.lastValue)
-        else:
-            val = float(self.value)
+        try:
+            polling = self.properties.device.properties.pollDelay
+            if (polling < 90 and polling > 0) or self.cov_registered:
+                val = float(self.lastValue)
+            else:
+                val = float(self.value)
+        except ValueError:
+            self._log.error(
+                "Cannot convert value {}. Device probably disconnected".format(
+                    self.value
+                )
+            )
+            # Probably disconnected
+            val = None
         return "{}/{} : {:.2f} {}".format(
             self.properties.device.properties.name,
             self.properties.name,
@@ -631,14 +706,24 @@ class NumericPoint(Point):
     def __add__(self, other):
         return self.value + other
 
+    __radd__ = __add__
+
     def __sub__(self, other):
         return self.value - other
+
+    def __rsub__(self, other):
+        return other - self.value
 
     def __mul__(self, other):
         return self.value * other
 
+    __rmul__ = __mul__
+
     def __truediv__(self, other):
         return self.value / other
+
+    def __rtruediv__(self, other):
+        return other / self.value
 
     def __lt__(self, other):
         return self.value < other
@@ -688,24 +773,17 @@ class BooleanPoint(Point):
             history_size=history_size,
         )
 
+    def _trend(self, res):
+        res = "1: active" if res == "active" else "0: inactive"
+        super()._trend(res)
+
     @property
     def value(self):
         """
         Read the value from BACnet network
         """
-        try:
-            res = self.properties.device.properties.network.read(
-                "{} {} {} presentValue".format(
-                    self.properties.device.properties.address,
-                    self.properties.type,
-                    str(self.properties.address),
-                ),
-                vendor_id=self.properties.device.properties.vendor_id,
-            )
-            self._trend(res)
-
-        except Exception as e:
-            raise
+        res = super().value
+        self._trend(res)
 
         if res == "inactive":
             self._key = 0
@@ -720,7 +798,11 @@ class BooleanPoint(Point):
         """
         returns : (boolean) Value
         """
-        if self.lastValue == 1 or self.lastValue == "active":
+        if ":" in self.lastValue:
+            _val = int(self.lastValue.split(":")[0])
+        else:
+            _val = self.lastValue
+        if _val in [1, "active"]:
             self._key = 1
             self._boolKey = True
         else:
@@ -736,16 +818,25 @@ class BooleanPoint(Point):
         return None
 
     def _set(self, value):
-        if value == True:
-            self._setitem("active")
-        elif value == False:
-            self._setitem("inactive")
-        elif str(value) in ["inactive", "active"] or str(value).lower() == "auto":
-            self._setitem(value)
-        else:
-            raise ValueError('Value must be boolean True, False or "active"/"inactive"')
+        try:
+            if value == True:
+                self._setitem("active")
+            elif value == False:
+                self._setitem("inactive")
+            elif str(value) in ["inactive", "active"] or str(value).lower() == "auto":
+                self._setitem(value)
+            else:
+                raise ValueError(
+                    'Value must be boolean True, False or "active"/"inactive"'
+                )
+        except (Exception, ValueError) as error:
+            raise WritePropertyException("Problem writing to device : {}".format(error))
 
     def __repr__(self):
+        polling = self.properties.device.properties.pollDelay
+        if (polling >= 90 or polling <= 0) and not self.cov_registered:
+            # Force reading
+            self.value
         return "{}/{} : {}".format(
             self.properties.device.properties.name, self.properties.name, self.boolValue
         )
@@ -795,17 +886,36 @@ class EnumPoint(Point):
             history_size=history_size,
         )
 
+    def _trend(self, res):
+        res = "{}: {}".format(res, self.get_state(res))
+        super()._trend(res)
+
+    @property
+    def value(self):
+        res = super().value
+        # self._log.info("Value : {}".format(res))
+        # self._log.info("EnumValue : {}".format(self.get_state(res)))
+        self._trend(res)
+        return res
+
+    def get_state(self, v):
+        try:
+            return self.properties.units_state[v - 1]
+        except TypeError:
+            return "n/a"
+
     @property
     def enumValue(self):
         """
         returns: (str) Enum state value
         """
         try:
-            return self.properties.units_state[int(self.lastValue) - 1]
+            if ":" in self.lastValue:
+                _val = int(self.lastValue.split(":")[0])
+                return self.get_state(_val)
         except TypeError:
-            # polling probably off, no last value
-            v = self.value
-            return self.properties.units_state[v - 1]
+            # probably first occurence of history... retry
+            return self.get_state(self.lastValue)
         except IndexError:
             value = "unknown"
         except ValueError:
@@ -820,20 +930,27 @@ class EnumPoint(Point):
         return None
 
     def _set(self, value):
-        if isinstance(value, int):
-            self._setitem(value)
-        elif str(value) in self.properties.units_state:
-            self._setitem(self.properties.units_state.index(value) + 1)
-        elif str(value).lower() == "auto":
-            self._setitem("auto")
-        else:
-            raise ValueError(
-                "Value must be integer or correct enum state : {}".format(
-                    self.properties.units_state
+        try:
+            if isinstance(value, int):
+                self._setitem(value)
+            elif str(value) in self.properties.units_state:
+                self._setitem(self.properties.units_state.index(value) + 1)
+            elif str(value).lower() == "auto":
+                self._setitem("auto")
+            else:
+                raise ValueError(
+                    "Value must be integer or correct enum state : {}".format(
+                        self.properties.units_state
+                    )
                 )
-            )
+        except (Exception, ValueError) as error:
+            raise WritePropertyException("Problem writing to device : {}".format(error))
 
     def __repr__(self):
+        polling = self.properties.device.properties.pollDelay
+        if (polling >= 90 or polling <= 0) and not self.cov_registered:
+            # Force reading
+            self.value
         return "{}/{} : {}".format(
             self.properties.device.properties.name, self.properties.name, self.enumValue
         )
@@ -844,7 +961,7 @@ class EnumPoint(Point):
 
 class StringPoint(Point):
     """
-    Representation of an Enumerated (multiState) value
+    Representation of CharacterString value
     """
 
     def __init__(
@@ -877,17 +994,39 @@ class StringPoint(Point):
         """
         return None
 
+    def _trend(self, res):
+        super()._trend(res)
+
+    @property
+    def value(self):
+        res = super().value
+        self._trend(res)
+        return res
+
     def _set(self, value):
-        if isinstance(value, str):
-            self._setitem(value)
-        elif isinstance(value, CharacterString):
-            self._setitem(value.value)
-        else:
-            raise ValueError("Value must be string or CharacterString")
+        try:
+            if isinstance(value, str):
+                self._setitem(value)
+            elif isinstance(value, CharacterString):
+                self._setitem(value.value)
+            else:
+                raise ValueError("Value must be string or CharacterString")
+        except (Exception, ValueError) as error:
+            raise WritePropertyException("Problem writing to device : {}".format(error))
 
     def __repr__(self):
+        try:
+            polling = self.properties.device.properties.pollDelay
+            if (polling < 90 and polling > 0) or self.cov_registered:
+                val = str(self.lastValue)
+            else:
+                val = str(self.value)
+        except ValueError:
+            self._log.error("Cannot convert value. Device probably disconnected")
+            # Probably disconnected
+            val = None
         return "{}/{} : {}".format(
-            self.properties.device.properties.name, self.properties.name, self.value
+            self.properties.device.properties.name, self.properties.name, val
         )
 
     def __eq__(self, other):

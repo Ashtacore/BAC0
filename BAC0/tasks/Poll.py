@@ -71,7 +71,7 @@ class DevicePoll(Task):
         :returns: Nothing
         """
         self._device = weakref.ref(device)
-        Task.__init__(self, name="{}_{}".format(prefix, name), delay=delay, daemon=True)
+        Task.__init__(self, name="{}_{}".format(prefix, name), delay=delay)
         self._counter = 0
 
     @property
@@ -81,11 +81,11 @@ class DevicePoll(Task):
     def task(self):
         try:
             self.device.read_multiple(
-                list(self.device.points_name), points_per_request=25
+                list(self.device.pollable_points_name), points_per_request=25
             )
             self._counter += 1
             if self._counter == self.device.properties.auto_save:
-                self.device.save()
+                self.device.save(resampling=self.device.properties.save_resampling)
                 if self.device.properties.clear_history_on_save:
                     self.device.clear_histories()
                 self._counter = 0
@@ -94,9 +94,10 @@ class DevicePoll(Task):
             # When creation fail, polling is created and fail the first time...
             # So kill the task
             self.stop()
-        except ValueError:
+        except ValueError as e:
             self.device._log.error(
-                "Something is wrong with polling...stopping. Try setting off segmentation"
+                "Something is wrong with polling...stopping. Try setting off "
+                "segmentation. Error: {}".format(e)
             )
             self.stop()
 
